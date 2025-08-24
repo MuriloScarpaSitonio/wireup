@@ -4,7 +4,7 @@ import importlib
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Type, Union
 
 import django
 import django.urls
@@ -13,6 +13,8 @@ from django.conf import settings
 from django.http import HttpRequest, HttpResponse
 from django.urls import URLPattern, URLResolver
 from django.utils.decorators import sync_and_async_middleware
+from django.views.generic import View
+from rest_framework.views import APIView as DrfAPIView
 
 import wireup
 from wireup import service
@@ -28,8 +30,12 @@ if TYPE_CHECKING:
 
 
 current_request: ContextVar[HttpRequest] = ContextVar("wireup_django_request")
-async_view_request_container: ContextVar[ScopedAsyncContainer] = ContextVar("wireup_async_view_request_container")
-sync_view_request_container: ContextVar[ScopedSyncContainer] = ContextVar("wireup_sync_view_request_container")
+async_view_request_container: ContextVar[ScopedAsyncContainer] = ContextVar(
+    "wireup_async_view_request_container"
+)
+sync_view_request_container: ContextVar[ScopedSyncContainer] = ContextVar(
+    "wireup_sync_view_request_container"
+)
 
 
 @sync_and_async_middleware
@@ -123,36 +129,95 @@ class WireupConfig(AppConfig):
                 continue
 
             if isinstance(p, URLPattern) and p.callback:  # type: ignore[reportUnnecessaryComparison]
-                if hasattr(p.callback, "view_class") and hasattr(p.callback, "view_initkwargs"):
-                    p.callback = self._inject_class_based_view(p.callback)
+                if hasattr(p.callback, "view_class") and hasattr(
+                    p.callback, "view_initkwargs"
+                ):
+                    if hasattr(p.callback, "cls") and issubclass(p.callback.cls, DrfAPIView):
+                        raise ValueError("DRF's @api_view decorator is not supported")
+                    p.callback = self._inject_django_class_based_view(p.callback)
+                elif hasattr(p.callback, "cls") and issubclass(
+                    p.callback.cls, DrfAPIView
+                ):
+                    p.callback = self._inject_drf_class_based_view(p.callback)
                 else:
                     p.callback = self.inject_scoped(p.callback)
 
-    def _inject_class_based_view(self, callback: Any) -> Any:
-        names_to_inject = get_valid_injection_annotated_parameters(self.container, callback.view_class)
+    def _inject_django_class_based_view(self, callback: Any) -> Any:
+        # This is taken from the django .as_view() method.
+        @functools.wraps(callback)
+        def view(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
+            handler = self._get_handler(request, callback.view_class)
+            injected_names = self._get_injected_names(handler)
+
+            this = callback.view_class(**callback.view_initkwargs, **injected_names)
+            this.setup(request, *args, **kwargs)
+            self._assert_request_attribute(this)
+            return this.dispatch(request, *args, **kwargs, **injected_names)
+
+        return view
+
+    def _inject_drf_class_based_view(self, callback: Any) -> Any:
+        actions, klass, initkwargs = callback.actions, callback.cls, callback.initkwargs
 
         # This is taken from the django .as_view() method.
         @functools.wraps(callback)
         def view(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
-            injected_names = {
-                name: self.container.params.get(param.annotation.param)
-                if isinstance(param.annotation, ParameterWrapper)
-                else get_request_container().get(param.klass, qualifier=param.qualifier_value)
-                for name, param in names_to_inject.items()
-                if param.annotation
-            }
+            this = klass(**initkwargs)
 
-            this = callback.view_class(**callback.view_initkwargs, **injected_names)
-            this.setup(request, *args, **kwargs)
-            if not hasattr(this, "request"):
-                raise AttributeError(
-                    "{} instance has no 'request' attribute. Did you override "  # noqa: EM103, UP032
-                    "setup() and forget to call super()?".format(callback.view_class.__name__)
-                )
-            return this.dispatch(request, *args, **kwargs)
+            if "get" in actions and "head" not in actions:
+                actions["head"] = actions["get"]
+
+            this.action_map = actions
+
+            for method, action in actions.items():
+                setattr(this, method, getattr(this, action))
+
+            this.request = request
+            this.args = args
+            this.kwargs = kwargs
+
+            self._assert_request_attribute(this)
+
+            handler = self._get_handler(request, this)
+            injected_names = self._get_injected_names(handler)
+            return this.dispatch(request, *args, **kwargs, **injected_names)
 
         return view
 
+    # helpers
+    def _assert_request_attribute(self, this: Any) -> None:
+        if not hasattr(this, "request"):
+            raise AttributeError(
+                "{} instance has no 'request' attribute. Did you override "  # noqa: EM103, UP032
+                "setup() and forget to call super()?".format(this.__class__.__name__)
+            )
+
+    def _get_injected_names(self, handler: Callable) -> dict[str, Any]:
+        names_to_inject = get_valid_injection_annotated_parameters(
+            self.container, handler
+        )
+        return {
+            name: (
+                self.container.params.get(param.annotation.param)
+                if isinstance(param.annotation, ParameterWrapper)
+                else get_request_container().get(
+                    param.klass, qualifier=param.qualifier_value
+                )
+            )
+            for name, param in names_to_inject.items()
+            if param.annotation
+        }
+
+    def _get_handler(self, request: HttpRequest, klass: Type[View]) -> Callable:
+        # This is taken from dispatch method of django/drf view class.
+        if request.method.lower() in klass.http_method_names:
+            handler = getattr(
+                klass, request.method.lower(), klass.http_method_not_allowed
+            )
+        else:
+            handler = klass.http_method_not_allowed
+        return handler
+    #
 
 @dataclass(frozen=True)
 class WireupSettings:
