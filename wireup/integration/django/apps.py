@@ -129,20 +129,9 @@ class WireupConfig(AppConfig):
                 continue
 
             if isinstance(p, URLPattern) and p.callback:  # type: ignore[reportUnnecessaryComparison]
-                if hasattr(p.callback, "view_class") and hasattr(
-                    p.callback, "view_initkwargs"
-                ):
-                    if hasattr(p.callback, "cls") and issubclass(p.callback.cls, DrfAPIView):
-                        if hasattr(p.callback.cls, "api_root_dict"):
-                            # skipping DRF's APIRootView, which is implicitly created by the 
-                            # DRF's DefaultRouter and it uses, more or less, the same logic as
-                            # DRF's @api_view decorator
-                            continue
-                        raise ValueError("DRF's @api_view decorator is not supported")
+                if hasattr(p.callback, "view_class") and hasattr(p.callback, "view_initkwargs"):
                     p.callback = self._inject_django_class_based_view(p.callback)
-                elif hasattr(p.callback, "cls") and issubclass(
-                    p.callback.cls, DrfAPIView
-                ):
+                elif hasattr(p.callback, "cls") and issubclass(p.callback.cls, DrfAPIView):
                     p.callback = self._inject_drf_class_based_view(p.callback)
                 else:
                     p.callback = self.inject_scoped(p.callback)
